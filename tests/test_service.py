@@ -426,3 +426,230 @@ def test_http_full_flow_two_batches(client):
     assert final["frames"][1]["function"] == "other_func"
     # 函数入口地址落在 DWARF 行表的函数声明行（第 1 行），与 addr2line 行为一致
     assert final["frames"][1]["source_line"] == 1
+
+
+# ---------------------------------------------------------------------------
+# 7. 只登记上报：立即回执、失败不留半份、重启后按号查栈
+# ---------------------------------------------------------------------------
+def test_register_only_ack_has_no_resolution_and_frames_are_queryable(client):
+    c, _store = client
+    addr = func_address(FIX / "demo-aaaa.elf", "crash_here")
+    r = c.post(
+        "/reports?register_only=true",
+        json={
+            "frames": [
+                {"build_id": BUILD_ID_A, "address": hex(addr)},
+                {"build_id": None, "address": "0xdeadbeef"},
+            ]
+        },
+    )
+    assert r.status_code == 201
+    body = r.json()
+    assert set(body) == {"report_id", "created_at", "frame_count"}
+    assert body["frame_count"] == 2  # 全部原始帧都已入库
+
+    # 值班员凭原入口按号查栈；未发布符号时帧原样保留
+    q = c.get(f"/reports/{body['report_id']}")
+    assert q.status_code == 200
+    frames = q.json()["frames"]
+    assert [f["address"] for f in frames] == [hex(addr), "0xdeadbeef"]
+    assert frames[0]["reason"] == "build_id_not_published_at_snapshot"
+    raw = c.get(f"/reports/{body['report_id']}/raw").json()
+    assert [f["address"] for f in raw["frames"]] == [hex(addr), "0xdeadbeef"]
+
+
+def test_register_only_completes_while_all_resolve_slots_busy_and_queue_waiting(client):
+    """解析满额且已有查栈在排队时，只登记仍能立即回执，不占解析名额。"""
+    c, store = client
+    store.publish_batch([("demo.elf", read_fixture("demo-aaaa.elf"))])
+    addr = func_address(FIX / "demo-aaaa.elf", "crash_here")
+    rid = store.create_report([{"build_id": BUILD_ID_A, "address": hex(addr)}])
+    store.limiter._limit = 1
+
+    entered = threading.Event()
+    release = threading.Event()
+    orig_resolve = store._resolve_report_unbounded
+
+    def blocked_resolve(report_id, snapshot_version=None):
+        entered.set()
+        assert release.wait(10)
+        return orig_resolve(report_id, snapshot_version)
+
+    store._resolve_report_unbounded = blocked_resolve
+    try:
+        results: dict = {}
+
+        def do_query():
+            results["r"] = c.get(f"/reports/{rid}", timeout=20)
+
+        holder = threading.Thread(target=do_query, daemon=True)
+        holder.start()
+        assert entered.wait(5)  # 唯一名额已被一次查栈占住
+
+        # 再发一次查栈，令其排在名额后面等待
+        waiting_before = store.limiter.stats()["waiting"]
+        queued = threading.Thread(target=do_query, daemon=True)
+        queued.start()
+        deadline = time.monotonic() + 5
+        while store.limiter.stats()["waiting"] <= waiting_before and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert store.limiter.stats()["waiting"] >= 1  # 确认有查栈在排队
+
+        started = time.monotonic()
+        r = c.post(
+            "/reports?register_only=true",
+            json={"frames": [{"build_id": BUILD_ID_A, "address": hex(addr)}]},
+            timeout=5,
+        )
+        elapsed = time.monotonic() - started
+        assert r.status_code == 201
+        assert set(r.json()) == {"report_id", "created_at", "frame_count"}
+        assert elapsed < 2.0  # 无需等解析腾出名额
+
+        release.set()
+        holder.join(20)
+        queued.join(20)
+        assert results["r"].status_code == 200
+        # 回执的报告号仍可正常按号查栈
+        assert c.get(f"/reports/{r.json()['report_id']}").json()["frame_count"] == 1
+    finally:
+        store._resolve_report_unbounded = orig_resolve
+        release.set()
+
+
+def test_register_only_write_failure_rolls_back_without_half_report(client):
+    """帧写入触发数据库错误时整体回滚：不留下报告头，也不消耗报告号。"""
+    c, store = client
+    first = c.post("/reports?register_only=true", json={"frames": [{"address": "0x1"}]})
+    assert first.status_code == 201
+
+    # 用真实触发器让 frames 写入失败，验证事务回滚而非测试桩
+    with store._db_lock, store._conn:
+        store._conn.execute(
+            "CREATE TRIGGER reject_frames BEFORE INSERT ON frames"
+            " BEGIN SELECT RAISE(ABORT, 'injected write failure'); END"
+        )
+    try:
+        bad = c.post(
+            "/reports?register_only=true",
+            json={"frames": [{"address": "0x2"}, {"address": "0x3"}]},
+        )
+    finally:
+        with store._db_lock, store._conn:
+            store._conn.execute("DROP TRIGGER reject_frames")
+
+    assert bad.status_code == 503
+    assert "登记失败" in bad.json()["detail"]
+    with store._db_lock:
+        report_rows = store._conn.execute("SELECT COUNT(*) n FROM reports").fetchone()["n"]
+        frame_rows = store._conn.execute("SELECT COUNT(*) n FROM frames").fetchone()["n"]
+    assert report_rows == 1  # 没有留下缺帧的报告头
+    assert frame_rows == 1
+    assert c.get(f"/reports/{first.json()['report_id']}").json()["frame_count"] == 1
+
+
+def test_register_only_report_survives_restart_and_resolves_after_upload(data_dir):
+    """只登记的报告重启后仍可按号查栈，补传符号后能解析。"""
+    from fastapi.testclient import TestClient
+
+    from app import main as main_module
+    from app.storage import Store as StoreCls
+
+    addr = func_address(FIX / "demo-aaaa.elf", "crash_here")
+
+    s1 = StoreCls(data_dir=data_dir)
+    main_module._store = s1
+    with TestClient(main_module.app) as c1:
+        rid = c1.post(
+            "/reports?register_only=true",
+            json={"frames": [{"build_id": BUILD_ID_A, "address": hex(addr)}]},
+        ).json()["report_id"]
+    main_module._store = None
+
+    # 模拟重启：全新 Store + 全新应用实例，凭原报告号查询
+    s2 = StoreCls(data_dir=data_dir)
+    main_module._store = s2
+    try:
+        with TestClient(main_module.app) as c2:
+            before = c2.get(f"/reports/{rid}")
+            assert before.status_code == 200
+            assert before.json()["frames"][0]["address"] == hex(addr)
+            assert before.json()["frames"][0]["status"] == "unresolved"
+
+            up = c2.post(
+                "/symbols/batch",
+                files=[
+                    ("files", ("demo.elf", read_fixture("demo-aaaa.elf"), "application/octet-stream"))
+                ],
+            )
+            assert up.status_code == 200
+            after = c2.get(f"/reports/{rid}").json()
+            assert after["frames"][0]["function"] == "crash_here"
+    finally:
+        main_module._store = None
+
+
+def test_resolve_limit_is_configurable_from_env(monkeypatch, tmp_path):
+    from app.config import resolve_concurrency
+    from app.storage import Store as StoreCls
+
+    monkeypatch.setenv("SYMBOL_RESOLVE_LIMIT", "2")
+    assert resolve_concurrency() == 2
+    s = StoreCls(data_dir=str(tmp_path / "d"))
+    try:
+        assert s.limiter.limit == 2
+    finally:
+        s.close()
+
+    monkeypatch.setenv("SYMBOL_RESOLVE_LIMIT", "0")
+    with pytest.raises(ValueError):
+        resolve_concurrency()
+    monkeypatch.setenv("SYMBOL_RESOLVE_LIMIT", "abc")
+    with pytest.raises(ValueError):
+        resolve_concurrency()
+
+
+def test_default_submit_and_query_share_the_same_limit(client):
+    """默认上报的同步解析与按号查栈共用同一上限：限额 1 时不会并发解析。"""
+    c, store = client
+    store.publish_batch([("demo.elf", read_fixture("demo-aaaa.elf"))])
+    store.limiter._limit = 1
+    addr = func_address(FIX / "demo-aaaa.elf", "crash_here")
+    rid = store.create_report([{"build_id": BUILD_ID_A, "address": hex(addr)}])
+
+    active_seen: list[int] = []
+    orig = store._resolve_report_unbounded
+
+    def observing(report_id, snapshot_version=None):
+        active_seen.append(store.limiter.stats()["active"])
+        time.sleep(0.2)
+        return orig(report_id, snapshot_version)
+
+    store._resolve_report_unbounded = observing
+    try:
+        statuses: list[int] = []
+
+        def submit():
+            statuses.append(
+                c.post(
+                    "/reports",
+                    json={"frames": [{"build_id": BUILD_ID_A, "address": hex(addr)}]},
+                    timeout=15,
+                ).status_code
+            )
+
+        t = threading.Thread(target=submit)
+        t.start()
+        time.sleep(0.05)
+        t0 = time.monotonic()
+        q = c.get(f"/reports/{rid}", timeout=15)
+        query_elapsed = time.monotonic() - t0
+        t.join(20)
+    finally:
+        store._resolve_report_unbounded = orig
+
+    assert q.status_code == 200 and q.json()["frames"][0]["function"] == "crash_here"
+    assert statuses == [201]
+    assert active_seen and max(active_seen) == 1  # 从未超过上限
+    assert query_elapsed >= 0.2  # 后到的查栈排队等待名额
+    assert store.limiter.stats()["active"] == 0

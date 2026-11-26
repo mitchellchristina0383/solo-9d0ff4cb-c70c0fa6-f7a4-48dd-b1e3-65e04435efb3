@@ -8,6 +8,7 @@ from __future__ import annotations
 import bisect
 import io
 import os
+import threading
 from dataclasses import dataclass
 from typing import Optional
 
@@ -290,19 +291,40 @@ class Symbolizer:
     """按文件路径惰性解析并缓存 _ParsedELF。
 
     缓存键带发布版本，文件一旦发布即不可变，因此缓存可长期复用。
+    用按 Build ID 的细粒度锁：同一文件并发查栈只解析一次，
+    不同文件仍可并行解析（不因缓存锁把解析全局串行化）。
     """
 
     def __init__(self) -> None:
         self._cache: dict[str, _ParsedELF] = {}
+        self._parse_locks: dict[str, threading.Lock] = {}
+        self._locks_guard = threading.Lock()
+
+    def _get_parse_lock(self, build_id: str) -> threading.Lock:
+        with self._locks_guard:
+            lock = self._parse_locks.get(build_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._parse_locks[build_id] = lock
+            return lock
+
+    def _get_parsed(self, path: str, build_id: str) -> _ParsedELF:
+        parsed = self._cache.get(build_id)
+        if parsed is not None:
+            return parsed
+        with self._get_parse_lock(build_id):
+            parsed = self._cache.get(build_id)
+            if parsed is None:
+                parsed = _parse_file(path, build_id)
+                self._cache[build_id] = parsed
+            return parsed
 
     def symbolize(self, path: str, build_id: str, address: int) -> FrameSymbol:
-        parsed = self._cache.get(build_id)
-        if parsed is None:
-            parsed = _parse_file(path, build_id)
-            self._cache[build_id] = parsed
+        parsed = self._get_parsed(path, build_id)
         function = parsed.lookup_function(address)
         file, line = parsed.lookup_line(address)
         return FrameSymbol(function=function, file=file, line=line)
 
     def evict(self, build_id: str) -> None:
-        self._cache.pop(build_id, None)
+        with self._get_parse_lock(build_id):
+            self._cache.pop(build_id, None)

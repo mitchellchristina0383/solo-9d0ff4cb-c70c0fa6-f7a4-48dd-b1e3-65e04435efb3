@@ -9,6 +9,8 @@ services:
       - symbol-data:/data
     environment:
       SYMBOL_DATA_DIR: /data
+      # 默认上报的同步解析与按号查栈共用的解析并发上限；只登记上报不占名额
+      SYMBOL_RESOLVE_LIMIT: "${SYMBOL_RESOLVE_LIMIT:-4}"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2).status==200 else 1)"]

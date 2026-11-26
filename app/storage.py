@@ -11,10 +11,11 @@ import hashlib
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Optional
+from typing import Iterator, Optional
 
-from .config import settings
+from .config import resolve_concurrency, settings
 from .elftools_ext import ELFValidationError, FrameSymbol, Symbolizer, inspect_blob
 
 
@@ -24,6 +25,46 @@ class StoredELF:
     sha256: str
     path: str
     version: int  # 首次发布时的版本（+1 后的值）
+
+
+class ResolveLimiter:
+    """可配置的解析并发上限（默认上报的同步解析与按号查栈共用）。
+
+    名额只由真正需要解析/查栈的请求占用；只登记上报不经过这里，
+    因此解析满额、查栈排队时登记仍能立即完成。
+    用普通线程条件变量实现，不依赖事件循环，线程池与测试线程都可使用。
+    """
+
+    def __init__(self, limit: Optional[int] = None) -> None:
+        self._limit = max(1, int(limit if limit is not None else resolve_concurrency()))
+        self._active = 0
+        self._waiting = 0
+        self._cond = threading.Condition()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @contextmanager
+    def slot(self) -> Iterator[None]:
+        with self._cond:
+            self._waiting += 1
+            try:
+                while self._active >= self._limit:
+                    self._cond.wait()
+                self._active += 1
+            finally:
+                self._waiting -= 1
+        try:
+            yield
+        finally:
+            with self._cond:
+                self._active -= 1
+                self._cond.notify()
+
+    def stats(self) -> dict:
+        with self._cond:
+            return {"limit": self._limit, "active": self._active, "waiting": self._waiting}
 
 
 class BatchRejected(Exception):
@@ -43,7 +84,11 @@ class Store:
         os.makedirs(self.elf_dir, exist_ok=True)
         # 粗粒度锁：发布互斥；查询用快照版本号，不阻塞发布
         self._lock = threading.RLock()
+        # SQLite 连接在线程池中被多个请求共用，所有语句访问都串行化；
+        # 只包住数据库读写，不覆盖耗时的 ELF 解析，因此查栈之间仍可并行。
+        self._db_lock = threading.RLock()
         self._symbolizer = Symbolizer()
+        self.limiter = ResolveLimiter()
         self._conn = sqlite3.connect(self.db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL");
@@ -88,15 +133,25 @@ class Store:
 
     def _reconcile_disk(self) -> None:
         """重启后核对：磁盘缺失的内容文件删除其映射，保证不悬挂。"""
-        with self._lock, self._conn:
-            for row in self._conn.execute("SELECT build_id, path FROM elfs").fetchall():
+        with self._lock, self._db_lock:
+            rows = self._conn.execute(
+                "SELECT build_id, path FROM elfs"
+            ).fetchall()
+            for row in rows:
                 if not os.path.isfile(row["path"]):
-                    self._conn.execute("DELETE FROM elfs WHERE build_id=?", (row["build_id"],))
+                    with self._conn:
+                        self._conn.execute(
+                            "DELETE FROM elfs WHERE build_id=?", (row["build_id"],)
+                        )
                     self._symbolizer.evict(row["build_id"])
 
     @property
     def symbol_version(self) -> int:
-        return int(self._conn.execute("SELECT value FROM meta WHERE key='symbol_version'").fetchone()["value"])
+        with self._db_lock:
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key='symbol_version'"
+            ).fetchone()
+        return int(row["value"])
 
     # ------------------------------------------------------------------
     # 批量发布
@@ -135,10 +190,14 @@ class Store:
 
         with self._lock:
             # 第二阶段：与已发布内容核对冲突
-            existing = {
-                r["build_id"]: r
-                for r in self._conn.execute("SELECT build_id, sha256 FROM elfs").fetchall()
-            }
+            with self._db_lock:
+                existing = {
+                    r["build_id"]: r
+                    for r in self._conn.execute(
+                        "SELECT build_id, sha256 FROM elfs"
+                    ).fetchall()
+                }
+                current_version = self.symbol_version
             for build_id, (filename, _blob, digest) in unique.items():
                 row = existing.get(build_id)
                 if row is not None and row["sha256"] != digest:
@@ -170,9 +229,9 @@ class Store:
                 new_entries.append((build_id, digest, final_path))
 
             if new_entries:
-                next_version = self.symbol_version + 1
+                next_version = current_version + 1
                 try:
-                    with self._conn:  # 单事务：映射与版本号一起提交
+                    with self._db_lock, self._conn:  # 单事务：映射与版本号一起提交
                         self._conn.executemany(
                             "INSERT INTO elfs(build_id, sha256, path, version)"
                             " VALUES(?,?,?,?)",
@@ -201,28 +260,47 @@ class Store:
     # 报告
     # ------------------------------------------------------------------
     def create_report(self, frames: list[dict]) -> int:
-        with self._lock, self._conn:
-            cur = self._conn.execute("INSERT INTO reports DEFAULT VALUES")
-            report_id = cur.lastrowid
-            for pos, frame in enumerate(frames):
-                self._conn.execute(
+        """登记报告与全部原始帧，成功返回报告号。
+
+        报告行与帧行在同一事务内写入：任一帧写入失败（如非法参数、磁盘/数据库错误）
+        整体回滚，不留下缺帧或只有报告头的半份数据。
+
+        只取数据库锁、不取发布锁：登记是短写事务，与整批发布互不阻塞，
+        也不占用解析并发名额。
+        """
+        try:
+            with self._db_lock, self._conn:
+                cur = self._conn.execute("INSERT INTO reports DEFAULT VALUES")
+                report_id = cur.lastrowid
+                self._conn.executemany(
                     "INSERT INTO frames(report_id, position, build_id, address)"
                     " VALUES(?,?,?,?)",
-                    (report_id, pos, frame.get("build_id"), str(frame["address"])),
+                    [
+                        (report_id, pos, frame.get("build_id"), str(frame["address"]))
+                        for pos, frame in enumerate(frames)
+                    ],
                 )
-            return report_id
+        except BaseException:
+            # sqlite3 连接上下文已 ROLLBACK；这里再确认一次，避免异常路径留下未结束事务
+            try:
+                self._conn.rollback()
+            except sqlite3.Error:
+                pass
+            raise
+        return report_id
 
     def get_report_raw(self, report_id: int) -> Optional[dict]:
-        report = self._conn.execute(
-            "SELECT id, created_at FROM reports WHERE id=?", (report_id,)
-        ).fetchone()
-        if report is None:
-            return None
-        frames = self._conn.execute(
-            "SELECT position, build_id, address FROM frames"
-            " WHERE report_id=? ORDER BY position",
-            (report_id,),
-        ).fetchall()
+        with self._db_lock:
+            report = self._conn.execute(
+                "SELECT id, created_at FROM reports WHERE id=?", (report_id,)
+            ).fetchone()
+            if report is None:
+                return None
+            frames = self._conn.execute(
+                "SELECT position, build_id, address FROM frames"
+                " WHERE report_id=? ORDER BY position",
+                (report_id,),
+            ).fetchall()
         return {
             "report_id": report["id"],
             "created_at": report["created_at"],
@@ -237,16 +315,24 @@ class Store:
     # ------------------------------------------------------------------
     def snapshot_paths(self, version: int) -> dict[str, StoredELF]:
         """取 <= version 的已发布 ELF 映射（查询开始时调用一次）。"""
-        rows = self._conn.execute(
-            "SELECT build_id, sha256, path, version FROM elfs WHERE version <= ?",
-            (version,),
-        ).fetchall()
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT build_id, sha256, path, version FROM elfs WHERE version <= ?",
+                (version,),
+            ).fetchall()
         return {
             r["build_id"]: StoredELF(r["build_id"], r["sha256"], r["path"], r["version"])
             for r in rows
         }
 
     def resolve_report(self, report_id: int, snapshot_version: Optional[int] = None) -> Optional[dict]:
+        """解析报告；占用解析并发名额（与默认上报的同步解析共用上限）。"""
+        with self.limiter.slot():
+            return self._resolve_report_unbounded(report_id, snapshot_version)
+
+    def _resolve_report_unbounded(
+        self, report_id: int, snapshot_version: Optional[int] = None
+    ) -> Optional[dict]:
         version = self.symbol_version if snapshot_version is None else snapshot_version
         raw = self.get_report_raw(report_id)
         if raw is None:
@@ -300,10 +386,12 @@ class Store:
         }
 
     def list_build_ids(self) -> list[dict]:
-        rows = self._conn.execute(
-            "SELECT build_id, sha256, version FROM elfs ORDER BY build_id"
-        ).fetchall()
+        with self._db_lock:
+            rows = self._conn.execute(
+                "SELECT build_id, sha256, version FROM elfs ORDER BY build_id"
+            ).fetchall()
         return [dict(r) for r in rows]
 
     def close(self) -> None:
-        self._conn.close()
+        with self._db_lock:
+            self._conn.close()
